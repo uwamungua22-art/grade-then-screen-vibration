@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""F6 期刊版组图 (JVET, 英文标签, 期刊风格, >=300dpi, PNG+PDF)。
-复用 ws1_4_methods.load() 的 usable 过滤口径, 仅用本地 parquet, 不读 G: 盘。
-口径: data-quality grading / trend screening; 横轴为场次序数(非标定时间); 不作诊断声明。
-端点变化统一用稳健"中位前3->中位后3"(与 QR2MSE 会议版一致), 而非字面单点。
-解释器: python -X utf8
+"""F6 journal-version figure set (JVET, English labels, journal style, >=300dpi, PNG+PDF).
+Reuses the usable filtering convention from ws1_4_methods.load(); uses local parquet only.
+Convention: data-quality grading / trend screening; x-axis is the session ordinal index
+(not calibrated time); no diagnostic claims are made.
+Endpoint change uses a robust "median of first 3 -> median of last 3" (consistent with the
+QR2MSE conference version) rather than a literal single point.
+Interpreter: python -X utf8
 """
 import os, re, io, sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -20,7 +22,7 @@ import ws1_4_methods as W
 OUT = r'./results'
 os.makedirs(OUT, exist_ok=True)
 
-# ---- 期刊风格 ----
+# ---- journal style ----
 plt.rcParams.update({
     'font.family': 'sans-serif',
     'font.sans-serif': ['Arial', 'DejaVu Sans'],
@@ -37,11 +39,11 @@ plt.rcParams.update({
     'savefig.dpi': 400,
     'savefig.bbox': 'tight',
 })
-# Okabe-Ito 色盲友好
+# Okabe-Ito colorblind-friendly
 CB = {'blue': '#0072B2', 'orange': '#E69F00', 'green': '#009E73', 'red': '#D55E00',
       'purple': '#CC79A7', 'sky': '#56B4E9', 'yellow': '#F0E442', 'grey': '#999999'}
 CM = 1 / 2.54
-COL1, COL2 = 8.6 * CM, 17.6 * CM  # Springer 单/双栏宽度
+COL1, COL2 = 8.6 * CM, 17.6 * CM  # Springer single/double column widths
 
 
 def save(fig, name):
@@ -63,11 +65,11 @@ def fisher_ci(stat, n, spearman=True, alpha=0.05):
 def short_label(name):
     ch = re.search(r'CH\s*(\d+)', name)
     tag = f'CH{ch.group(1)}' if ch else name[:6]
-    if '换向器' in name:
+    if 'commutator' in name or 'reversing' in name:
         kind = 'commutator'
-    elif '丝杠' in name:
+    elif 'screw' in name:
         kind = 'lead-screw'
-    elif '导轨' in name:
+    elif 'guide' in name or 'rail' in name:
         kind = 'guide-rail'
     else:
         kind = ''
@@ -82,18 +84,18 @@ def series(named, point):
 def main():
     df = W.load()
     u = df[df['usable']].copy()
-    named = u[u.point_name.str.contains('门|导轨|丝杠|换向|水电|升降', na=False)]
+    named = u[u.point_name.str.contains('reversing|commutator|ball|screw|guide|rail|seat|conn|lift', case=False, na=False)]
     pts = [p for p, c in named.point_name.value_counts().items() if c >= 8]
 
-    # changepoints from R3 (序数, 0-based)
-    cp = {'CH 6-下门-换向器-y轴': 7, 'CH19-下门-右丝杠下': 9, 'CH 16-DZQ升降右丝杠下': 16}
+    # changepoints from R3 (ordinal, 0-based)
+    cp = {'CH6 reversing/commutator unit': 7, 'CH19 ball screw R-low': 9, 'CH16 lift screw': 16}
 
     # =========================================================
-    # Fig 1: 数据质量分级 + 消融 + 阈值稳健性
+    # Fig 1: data-quality grading + ablation + threshold robustness
     # =========================================================
     fig, ax = plt.subplots(1, 3, figsize=(COL2, 5.2 * CM))
 
-    # (a) 四类分级计数
+    # (a) four-class grading counts
     cls = ['Trustworthy', 'Over-range', 'Electrical\nspike', 'Empty']
     cnt = [412, 143, 189, 144]
     cols = [CB['green'], CB['orange'], CB['red'], CB['grey']]
@@ -108,7 +110,7 @@ def main():
                ha='right', va='top', fontsize=6.5,
                bbox=dict(boxstyle='round', fc='white', ec=CB['grey'], lw=0.6))
 
-    # (b) 峭度: 尖峰 vs 可信
+    # (b) kurtosis: spike vs trustworthy
     nonempty = df[(df.sample_rate == 8000) & (~df.is_empty)]
     k_spike = nonempty[nonempty.hard_spike].td_kurtosis.dropna().values
     k_trust = df[df.usable].td_kurtosis.dropna().values
@@ -130,7 +132,7 @@ def main():
     ax[1].text(1.33, np.median(k_spike), f'med {np.median(k_spike):.1f}', fontsize=6,
                color=CB['red'], va='center', ha='left')
 
-    # (c) 阈值敏感性
+    # (c) threshold sensitivity
     f5 = pd.read_csv(os.path.join(OUT, 'F5_threshold_sensitivity.csv'))
     ax2 = ax[2]
     ax2.plot(f5.theta * 100, f5.n_spike, 'o-', color=CB['red'], ms=3, lw=1.0, label='Spike')
@@ -150,13 +152,13 @@ def main():
     save(fig, 'F6_fig1_dataquality')
 
     # =========================================================
-    # Fig 2: 趋势筛查 + 效应量CI (接受 CH6/CH19, 拒绝 CH16/CH10)
+    # Fig 2: trend screening + effect-size CI (accept CH6/CH19, reject CH16/CH10)
     # =========================================================
     panels = [
-        ('CH 6-下门-换向器-y轴', 'ACCEPTED', CB['green']),
-        ('CH19-下门-右丝杠下', 'ACCEPTED', CB['green']),
-        ('CH 16-DZQ升降右丝杠下', 'WITHDRAWN (non-monotonic)', CB['orange']),
-        ('CH 10-右门-丝杠中', 'EXCLUDED (negative artifact)', CB['red']),
+        ('CH6 reversing/commutator unit', 'ACCEPTED', CB['green']),
+        ('CH19 ball screw R-low', 'ACCEPTED', CB['green']),
+        ('CH16 lift screw', 'WITHDRAWN (non-monotonic)', CB['orange']),
+        ('CH10 screw R-mid', 'EXCLUDED (negative artifact)', CB['red']),
     ]
     fig, axs = plt.subplots(2, 2, figsize=(COL2, 12 * CM))
     for axp, (pt, verdict, vc) in zip(axs.ravel(), panels):
@@ -164,17 +166,17 @@ def main():
         n = len(y); x = np.arange(n)
         rho, _ = spearmanr(x, y); rlo, rhi = fisher_ci(rho, n)
         sen, b0, slo, shi = theilslopes(y, x, 0.95)
-        # 稳健端点(中位前3->后3)与字面
+        # robust endpoints (median of first 3 -> last 3) and literal
         med0, med1 = np.median(y[:3]), np.median(y[-3:])
         pct = 100 * (med1 / med0 - 1)
         axp.scatter(x, y, s=14, color=vc, edgecolor='k', linewidth=0.3, zorder=3, alpha=0.85)
         xs = np.array([0, n - 1])
         axp.plot(xs, b0 + sen * xs, '-', color='k', lw=1.2, zorder=4,
                  label=f'Theil–Sen {sen:+.3f} g/session')
-        # CI 带
+        # CI band
         axp.fill_between([0, n - 1], [b0 + slo * 0, b0 + slo * (n - 1)],
                          [b0 + shi * 0, b0 + shi * (n - 1)], color='k', alpha=0.12, zorder=1)
-        # 物理量 RMS>=0: 钳下限到 0, 上限留题注空间; CI 带负值部分被裁
+        # physical quantity RMS>=0: clamp lower limit to 0, leave headroom for caption; negative part of CI band is clipped
         ymax = float(y.max())
         axp.set_ylim(0, ymax * 1.18)
         if pt in cp:
@@ -195,9 +197,9 @@ def main():
     save(fig, 'F6_fig2_trend_screening')
 
     # =========================================================
-    # Fig 3: 跨传感器空间一致性 (替代验证)
+    # Fig 3: cross-sensor spatial consistency (alternative validation)
     # =========================================================
-    # 重算两两 Spearman 矩阵(共同场次>=8)
+    # recompute pairwise Spearman matrix (common sessions >=8)
     labels = [short_label(p) for p in pts]
     order = np.argsort(labels)
     pts_o = [pts[i] for i in order]; labels_o = [labels[i] for i in order]
@@ -237,7 +239,7 @@ def main():
                bbox=dict(boxstyle='round', fc='white', ec=CB['grey'], lw=0.6))
     save(fig, 'F6_fig3_spatial_consistency')
 
-    print('\nF6 期刊版组图完成 ->', OUT)
+    print('\nF6 journal-version figure set complete ->', OUT)
 
 
 if __name__ == '__main__':

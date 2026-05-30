@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""WS5: 为审稿统计缺口补算 —— 自相关 + 效应量95%CI + Sen斜率CI。
-复用 ws1_4_methods 的 load()/usable 过滤与排序口径, 不重读220GB。"""
+"""WS5: fills statistical gaps raised in review -- autocorrelation + effect-size 95% CI + Sen slope CI.
+Reuses the load()/usable filtering and sorting conventions of ws1_4_methods; reads only the local
+parquet feature table, does not touch any raw-waveform store."""
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import numpy as np
@@ -9,8 +10,8 @@ from scipy.stats import spearmanr, pearsonr, kendalltau, norm, theilslopes
 
 import ws1_4_methods as W
 
-TARGETS = ['CH 6-下门-换向器-y轴', 'CH19-下门-右丝杠下',
-           'CH 16-DZQ升降右丝杠下', 'CH 10-右门-丝杠中']
+TARGETS = ['CH6 reversing/commutator unit', 'CH19 ball screw R-low',
+           'CH16 lift screw', 'CH10 screw R-mid']
 
 
 def fisher_ci(stat, n, spearman=False, alpha=0.05):
@@ -48,7 +49,7 @@ def durbin_watson(resid):
 def main():
     df = W.load()
     u = df[df['usable']].copy()
-    named = u[u.point_name.str.contains('门|导轨|丝杠|换向|水电|升降', na=False)]
+    named = u[u.point_name.str.contains('reversing|commutator|ball|screw|guide|rail|seat|conn|lift', case=False, na=False)]
 
     print('point | n | rho[95%CI] | tau[95%CI] | r[95%CI] | Sen[95%CI] | '
           'lag1_raw | lag1_resid(Sen) | DW_resid')

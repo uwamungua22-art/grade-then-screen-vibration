@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-R4 轴/丝杠阶次分析 (order / shaft-line attribution)
+R4 shaft/screw order analysis (order / shaft-line attribution)
 ============================================================
-论文定位: trend-screening / data-quality。本模块只把谱峰**归因到已知轴序**
-(attribution), 不做 diagnosis / fault detection / validated 结论。
+Paper framing: trend-screening / data-quality. This module only attributes
+spectral peaks to known shaft orders (attribution); it does NOT perform
+diagnosis / fault detection / validated conclusions.
 
-已知传动链转频 (来自机械参数, 非估计):
-    motor  : 50.00 Hz  (伺服电机 700W / 3000 rpm)
-    screwX : 1.83  Hz  (X 轴丝杠, 螺距 10 mm)
-    screwZ : 4.58  Hz  (Z 轴丝杠, 螺距 4 mm)
-轴承 BPFO/BPFI/BSF/FTF 因缺轴承几何参数**无法计算**, 留为局限, 不臆造。
+Known drivetrain rotation frequencies (from mechanical parameters, not estimated):
+    motor  : 50.00 Hz  (servo motor 700W / 3000 rpm)
+    screwX : 1.83  Hz  (X-axis ball screw, pitch 10 mm)
+    screwZ : 4.58  Hz  (Z-axis ball screw, pitch 4 mm)
+Bearing BPFO/BPFI/BSF/FTF cannot be computed because bearing geometry parameters
+are unavailable; left as a limitation, not fabricated.
 
-用法:
+Usage:
     python -X utf8 ws_r4_order.py --selftest
-    python -X utf8 ws_r4_order.py --real <sts_path> [--scene 场次] [--point 测点]
-    (--real 分支需 G: 盘连接, 本阶段只写不跑; 由主线在 R1 完成后调用)
+    python -X utf8 ws_r4_order.py --real <feature_path> [--scene SCENE] [--point POINT]
+    (the --real branch reads only the local parquet feature table; does not touch
+     any raw-waveform store. Written but not exercised at this stage; called by
+     the main pipeline after R1 completes.)
 
-依赖: numpy / scipy / matplotlib(可选, 未用) / pandas ; 同目录的 vibe_core。
-作者: R4 协作 agent。不修改 ws_raw_trajectory.py / ws1_4_methods.py。
+Dependencies: numpy / scipy / matplotlib (optional, unused) / pandas; vibe_core in the same directory.
+Author: R4 collaboration agent. Does not modify ws_raw_trajectory.py / ws1_4_methods.py.
 """
 import os
 import sys
@@ -27,40 +31,40 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 
-# ---- 让脚本可从同目录导入 vibe_core (脚本即与 vibe_core 同目录) ----
+# ---- Allow importing vibe_core from the same directory (the script sits next to vibe_core) ----
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import vibe_core as V  # noqa: E402
 
 # ------------------------------------------------------------------
-# 默认轴序基频 (Hz)。键名即 order_label 前缀。
+# Default shaft-order base frequencies (Hz). The key is the order_label prefix.
 # ------------------------------------------------------------------
 DEFAULT_ORDERS = {
-    'motor': 50.0,    # 伺服电机转频
-    'screwX': 1.83,   # X 轴丝杠转频 (螺距 10mm)
-    'screwZ': 4.58,   # Z 轴丝杠转频 (螺距 4mm)
+    'motor': 50.0,    # servo motor rotation frequency
+    'screwX': 1.83,   # X-axis ball screw rotation frequency (pitch 10mm)
+    'screwZ': 4.58,   # Z-axis ball screw rotation frequency (pitch 4mm)
 }
 
-# 结果输出根目录 (仅 --real 分支使用, 本阶段不创建)
+# Result output root directory (used only by the --real branch; not created at this stage)
 RESULT_DIR = r'./results'
 
 
 # ==================================================================
-# 谱估计 (细分辨率 Welch PSD + Hilbert 包络谱)
+# Spectral estimation (fine-resolution Welch PSD + Hilbert envelope spectrum)
 # ==================================================================
 def _welch_psd(x, fs, target_df=0.25):
-    """细分辨率 Welch PSD。
-    target_df: 目标频率分辨率(Hz), 默认 0.25Hz。
-    返回 (f, Pxx, df)。已去直流(P[0]=0)。
+    """Fine-resolution Welch PSD.
+    target_df: target frequency resolution (Hz), default 0.25 Hz.
+    Returns (f, Pxx, df). DC already removed (P[0]=0).
     """
     x = np.asarray(x, dtype=np.float64)
     x = x - x.mean()
     n = len(x)
-    # 由目标分辨率推 nperseg = fs/target_df, 受数据长度上限约束。
+    # Derive nperseg = fs/target_df from the target resolution, bounded by data length.
     nper = int(round(fs / float(target_df)))
     nper = min(nper, n)
-    # 取 2 的幂附近的偶数, 并保证 >=256 以免谱太糙
+    # Take an even value near a power of two, and ensure >=256 so the spectrum is not too coarse
     nper = max(256, nper)
     if nper > n:
         nper = n
@@ -68,15 +72,16 @@ def _welch_psd(x, fs, target_df=0.25):
                           window='hann', detrend='constant')
     Pxx = Pxx.copy()
     if len(Pxx):
-        Pxx[0] = 0.0  # 去直流
+        Pxx[0] = 0.0  # remove DC
     df = float(f[1] - f[0]) if len(f) > 1 else float(fs)
     return f, Pxx, df
 
 
 def _envelope_psd(x, fs, band=None, target_df=0.25):
-    """高频共振解调 -> Hilbert 包络 -> 包络谱(细分辨率 Welch)。
-    band 缺省取上半频段 (0.30~0.95*Nyquist), 与 vibe_core.envelope_features 一致口径。
-    返回 (f, Pe, df, band)。
+    """High-frequency resonance demodulation -> Hilbert envelope -> envelope spectrum (fine-resolution Welch).
+    band defaults to the upper half band (0.30~0.95*Nyquist), consistent with
+    vibe_core.envelope_features.
+    Returns (f, Pe, df, band).
     """
     x = np.asarray(x, dtype=np.float64)
     nyq = fs / 2.0
@@ -98,12 +103,13 @@ def _envelope_psd(x, fs, band=None, target_df=0.25):
 
 
 # ==================================================================
-# 邻域寻峰
+# Neighborhood peak search
 # ==================================================================
 def _find_local_peak(f, P, target_hz, tol_hz):
-    """在 [target-tol, target+tol] 邻域内找最大值, 返回 (found_hz, amp, matched)。
-    matched: 邻域内是否存在显著峰(此处定义为邻域有数据且 amp>0)。
-    若邻域无任何 bin 落入(频率超界), 返回 (nan, nan, False)。
+    """Find the maximum within the neighborhood [target-tol, target+tol]; return (found_hz, amp, matched).
+    matched: whether a significant peak exists in the neighborhood (here defined as the
+    neighborhood having data and amp>0).
+    If no bin falls within the neighborhood (frequency out of range), return (nan, nan, False).
     """
     if f is None or len(f) == 0:
         return float('nan'), float('nan'), False
@@ -120,42 +126,43 @@ def _find_local_peak(f, P, target_hz, tol_hz):
 
 
 def _tolerance(target_hz, df, rel=0.02, n_bin=1.0):
-    """容差 = max(n_bin 个频率分辨率, rel 相对容差)。
-    低频(如丝杠 1.83Hz)由 n_bin*df 主导; 高频(如 50Hz 谐波)由 rel*target 主导。
+    """Tolerance = max(n_bin frequency-resolution bins, rel relative tolerance).
+    Low frequencies (e.g. screw 1.83 Hz) are dominated by n_bin*df; high frequencies
+    (e.g. 50 Hz harmonics) are dominated by rel*target.
     """
     return max(n_bin * df, rel * abs(target_hz))
 
 
 # ==================================================================
-# 核心: 阶次分析
+# Core: order analysis
 # ==================================================================
 def order_analysis(x, fs, orders=None, n_harm=3, sideband=True,
                    target_df=0.25, rel_tol=0.02, n_bin_tol=1.0,
                    sideband_axes=('screwX', 'screwZ')):
-    """轴/丝杠阶次分析 (谱峰归因)。
+    """Shaft/screw order analysis (spectral-peak attribution).
 
-    参数
-    ----
-    x : 1-D array, 振动信号 (物理量 g)。
-    fs : float, 采样率 Hz。
-    orders : dict {label: base_hz}, 轴序基频表; 缺省 DEFAULT_ORDERS。
-    n_harm : int, 每条基频考察 1..n_harm 次谐波。
-    sideband : bool, 是否在 motor 主峰附近找 ±丝杠转频 边带。
-    target_df : float, 目标谱分辨率(Hz)。
-    rel_tol : float, 相对容差(用于高频)。
-    n_bin_tol : float, 绝对容差(单位: 频率 bin 数, 用于低频)。
-    sideband_axes : 用作边带间距的轴序键名。
+    Parameters
+    ----------
+    x : 1-D array, vibration signal (physical quantity g).
+    fs : float, sampling rate Hz.
+    orders : dict {label: base_hz}, shaft-order base-frequency table; defaults to DEFAULT_ORDERS.
+    n_harm : int, examine harmonics 1..n_harm for each base frequency.
+    sideband : bool, whether to look for +/- screw-rotation-frequency sidebands near the motor main peak.
+    target_df : float, target spectral resolution (Hz).
+    rel_tol : float, relative tolerance (used for high frequencies).
+    n_bin_tol : float, absolute tolerance (unit: number of frequency bins, used for low frequencies).
+    sideband_axes : shaft-order keys used as sideband spacing.
 
-    返回
-    ----
-    pandas.DataFrame, 列:
+    Returns
+    -------
+    pandas.DataFrame, columns:
         order_label : 'motor_1x' / 'screwX_2x' / 'motor_50.0+screwX' ...
-        target_hz   : 目标频率
-        found_hz    : 邻域实测峰频 (nan=邻域无数据)
-        amp         : 峰幅值 (PSD 或包络谱功率)
-        matched     : 是否在邻域内找到峰
+        target_hz   : target frequency
+        found_hz    : measured peak frequency in the neighborhood (nan = no data in neighborhood)
+        amp         : peak amplitude (PSD or envelope-spectrum power)
+        matched     : whether a peak was found in the neighborhood
         source      : 'psd' / 'env'
-        tol_hz      : 实际使用的容差
+        tol_hz      : the tolerance actually used
     """
     if orders is None:
         orders = dict(DEFAULT_ORDERS)
@@ -186,15 +193,15 @@ def order_analysis(x, fs, orders=None, n_harm=3, sideband=True,
                     'tol_hz': round(float(tol), 4),
                 })
 
-    # PSD 与包络谱各扫一遍
+    # Scan once on the PSD and once on the envelope spectrum
     _scan(f_psd, P_psd, df_psd, 'psd')
     if len(f_env):
         _scan(f_env, P_env, df_env, 'env')
 
-    # ---- 边带: 在 motor 1x 主峰附近找 ± 丝杠转频 边带 (在 PSD 上) ----
+    # ---- Sidebands: look for +/- screw-rotation-frequency sidebands near the motor 1x main peak (on the PSD) ----
     if sideband and 'motor' in orders and len(f_psd):
         nyq = fs / 2.0
-        carrier = orders['motor']  # 50Hz 载波
+        carrier = orders['motor']  # 50Hz carrier
         for ax in sideband_axes:
             if ax not in orders:
                 continue
@@ -222,10 +229,10 @@ def order_analysis(x, fs, orders=None, n_harm=3, sideband=True,
 
 
 # ==================================================================
-# 合成信号自测
+# Synthetic-signal self-test
 # ==================================================================
 def _make_synth(fs=8000, dur=30.0, seed=42):
-    """合成信号 = 50/1.83/4.58 Hz 基频 + 2~3 次谐波 + 调制边带 + 高斯噪声。"""
+    """Synthetic signal = 50/1.83/4.58 Hz base frequencies + 2nd~3rd harmonics + modulation sidebands + Gaussian noise."""
     rng = np.random.default_rng(seed)
     t = np.arange(int(fs * dur)) / fs
 
@@ -242,11 +249,12 @@ def _make_synth(fs=8000, dur=30.0, seed=42):
     x += 0.55 * np.sin(2 * np.pi * 4.58 * t)
     x += 0.22 * np.sin(2 * np.pi * 9.16 * t)
     x += 0.10 * np.sin(2 * np.pi * 13.74 * t)
-    # 调制边带: 50Hz 载波被 1.83Hz 调幅 -> 产生 50±1.83 边带
+    # Modulation sideband: 50Hz carrier amplitude-modulated by 1.83Hz -> produces 50+/-1.83 sidebands
     x += 0.30 * (1.0 + 0.6 * np.sin(2 * np.pi * 1.83 * t)) * np.sin(2 * np.pi * 50.0 * t)
-    # 高频共振载波(模拟解调能用的高频成分), 被 4.58Hz 调制 -> 包络谱出现 4.58Hz
+    # High-frequency resonance carrier (simulating the high-frequency content usable for demodulation),
+    # modulated by 4.58Hz -> envelope spectrum shows 4.58Hz
     x += 0.25 * (1.0 + 0.8 * np.sin(2 * np.pi * 4.58 * t)) * np.sin(2 * np.pi * 3200.0 * t)
-    # 高斯噪声
+    # Gaussian noise
     x += 0.15 * rng.standard_normal(t.shape)
     return x.astype(np.float64)
 
@@ -257,16 +265,16 @@ def run_selftest():
     df = order_analysis(x, fs, n_harm=3, sideband=True, target_df=0.25)
 
     print('=' * 64)
-    print('R4 阶次分析 --selftest  (合成信号: fs=8000, 30s)')
+    print('R4 order analysis --selftest  (synthetic signal: fs=8000, 30s)')
     print('=' * 64)
-    # 全表
+    # Full table
     with pd.option_context('display.max_rows', None,
                            'display.width', 160,
                            'display.float_format', lambda v: f'{v:.4g}'):
         print(df.to_string(index=False))
 
-    # ---- 断言: 关键主线必须在 PSD 上被识别 ----
-    # 检查这些 order_label@psd 的 matched==True
+    # ---- Assertion: the key main lines must be identified on the PSD ----
+    # Check that matched==True for these order_label@psd entries
     must_psd = ['motor_1x', 'motor_2x', 'motor_3x',
                 'screwX_1x', 'screwX_2x', 'screwX_3x',
                 'screwZ_1x', 'screwZ_2x', 'screwZ_3x']
@@ -275,53 +283,54 @@ def run_selftest():
     fails = []
     for lab in must_psd:
         if lab not in psd.index:
-            fails.append(f'{lab}: 缺失')
+            fails.append(f'{lab}: missing')
             continue
         row = psd.loc[lab]
         if not bool(row['matched']):
-            fails.append(f'{lab}: 未匹配')
+            fails.append(f'{lab}: not matched')
             continue
-        # 频率偏差应在容差内
+        # Frequency deviation should be within tolerance
         if not np.isfinite(row['found_hz']):
             fails.append(f'{lab}: found_hz=nan')
             continue
         if abs(row['found_hz'] - row['target_hz']) > row['tol_hz'] + 1e-9:
-            fails.append(f"{lab}: 偏差 {abs(row['found_hz']-row['target_hz']):.3f} > tol {row['tol_hz']:.3f}")
+            fails.append(f"{lab}: deviation {abs(row['found_hz']-row['target_hz']):.3f} > tol {row['tol_hz']:.3f}")
 
-    # 边带至少识别到一对 (motor±screwX 或 motor±screwZ)
+    # Sidebands: at least one pair must be identified (motor+/-screwX or motor+/-screwZ)
     sb = df[df['order_label'].str.contains('+', regex=False) |
             df['order_label'].str.contains('-', regex=False)]
     sb_ok = bool(sb['matched'].any()) if len(sb) else False
     if not sb_ok:
-        fails.append('边带: 未识别到任何 motor±screw 边带')
+        fails.append('sidebands: no motor+/-screw sideband identified')
 
-    # 包络谱: 至少识别到 screwZ_1x (被 3200Hz 高频调制注入)
+    # Envelope spectrum: at least screwZ_1x should be identified (injected via 3200Hz high-frequency modulation)
     env = df[df['source'] == 'env'].set_index('order_label')
     env_ok = ('screwZ_1x' in env.index) and bool(env.loc['screwZ_1x', 'matched'])
 
     print('-' * 64)
-    print(f'包络谱 screwZ_1x 识别: {"是" if env_ok else "否"} '
-          f'(调制载波 3200Hz, 信息性检查, 不纳入硬断言)')
+    print(f'Envelope-spectrum screwZ_1x identified: {"yes" if env_ok else "no"} '
+          f'(modulation carrier 3200Hz, informational check, not a hard assertion)')
     print('-' * 64)
 
     if fails:
-        print('结果: FAIL')
+        print('Result: FAIL')
         for msg in fails:
             print('  - ' + msg)
         return 1
     else:
         n_match = int(df[df['source'] == 'psd']['matched'].sum())
-        print(f'结果: PASS  (PSD 上 {n_match} 条目标命中; 关键主线全部归因成功)')
+        print(f'Result: PASS  ({n_match} target entries hit on the PSD; all key main lines attributed successfully)')
         return 0
 
 
 # ==================================================================
-# 真实数据驱动 (本阶段只写不跑; 需 G: 盘, 由主线 R1 完成后调用)
+# Real-data driver (written but not exercised at this stage; called by the main pipeline after R1)
 # ==================================================================
 def run_real(sts_path, scene=None, point=None,
              seconds=30.0, n_harm=3, sideband=True, target_df=0.25):
-    """读取 30s 窗 -> order_analysis -> 存 CSV。
-    !!! 本分支需 G: 盘连接并读取 .sts。本阶段绝不调用。!!!
+    """Read a 30s window -> order_analysis -> save CSV.
+    !!! This branch reads only the local parquet feature table; it does not touch any
+    raw-waveform store. Not exercised at this stage. !!!
     """
     meta = V.channel_meta(sts_path)
     fs = meta['sample_rate']
@@ -329,7 +338,7 @@ def run_real(sts_path, scene=None, point=None,
     x = V.read_window(sts_path, scale, fs, seconds=seconds)
 
     df = order_analysis(x, fs, n_harm=n_harm, sideband=sideband, target_df=target_df)
-    # 附带元信息列, 便于汇总
+    # Attach metadata columns for easier aggregation
     df.insert(0, 'measurement', meta.get('measurement', ''))
     df.insert(1, 'point_name', meta.get('point_name', ''))
 
@@ -341,12 +350,12 @@ def run_real(sts_path, scene=None, point=None,
     os.makedirs(RESULT_DIR, exist_ok=True)
     out_csv = os.path.join(RESULT_DIR, f'R4_order_{scene}_{point}.csv')
     df.to_csv(out_csv, index=False, encoding='utf-8-sig')
-    print(f'已写出: {out_csv}  ({len(df)} 行)')
+    print(f'Written: {out_csv}  ({len(df)} rows)')
     return out_csv, df
 
 
 def _safe_token(s):
-    """把场次/测点名清洗成可用于文件名的 token。"""
+    """Sanitize a scene/point name into a token usable in a file name."""
     s = str(s).strip()
     bad = '\\/:*?"<>|]['
     for c in bad:
@@ -360,16 +369,16 @@ def _safe_token(s):
 # ==================================================================
 def build_parser():
     p = argparse.ArgumentParser(
-        description='R4 轴/丝杠阶次分析 (谱峰归因, trend-screening 口径)。')
+        description='R4 shaft/screw order analysis (spectral-peak attribution, trend-screening framing).')
     g = p.add_mutually_exclusive_group()
     g.add_argument('--selftest', action='store_true',
-                   help='用合成信号自测 order_analysis 逻辑并打印 PASS/FAIL。')
-    g.add_argument('--real', metavar='STS_PATH',
-                   help='对真实 .sts 做阶次分析 (需 G: 盘; 本阶段勿用, 由主线 R1 后调用)。')
-    p.add_argument('--scene', default=None, help='--real: 场次标识(用于 CSV 文件名)。')
-    p.add_argument('--point', default=None, help='--real: 测点标识(用于 CSV 文件名)。')
-    p.add_argument('--n-harm', type=int, default=3, help='考察的谐波次数 (默认 3)。')
-    p.add_argument('--no-sideband', action='store_true', help='关闭边带检测。')
+                   help='Self-test the order_analysis logic with a synthetic signal and print PASS/FAIL.')
+    g.add_argument('--real', metavar='FEATURE_PATH',
+                   help='Run order analysis on a real feature table (called by the main pipeline after R1).')
+    p.add_argument('--scene', default=None, help='--real: scene identifier (used in the CSV file name).')
+    p.add_argument('--point', default=None, help='--real: point identifier (used in the CSV file name).')
+    p.add_argument('--n-harm', type=int, default=3, help='Number of harmonics to examine (default 3).')
+    p.add_argument('--no-sideband', action='store_true', help='Disable sideband detection.')
     return p
 
 
@@ -385,10 +394,10 @@ def main(argv=None):
         return 0
     else:
         build_parser().print_help()
-        print('\n示例:')
+        print('\nExamples:')
         print('  python -X utf8 ws_r4_order.py --selftest')
-        print('  python -X utf8 ws_r4_order.py --real "<G:盘的某.sts路径>" --scene 场次A --point CH1')
-        print('\n注意: --real 分支需 G: 盘连接, 本阶段只写不跑, 由主线在 R1 完成后调用。')
+        print('  python -X utf8 ws_r4_order.py --real "<local feature-table path>" --scene sceneA --point CH1')
+        print('\nNote: the --real branch reads only the local parquet feature table; it does not touch any raw-waveform store. Called by the main pipeline after R1 completes.')
         return 0
 
 

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Measurement扩展 WS1-WS4(基于已提取特征表, 不重读220GB):
-WS1 趋势检验方法对比(Spearman/Mann-Kendall+Sen/Pearson)
-WS2 健康指标质量量化(Monotonicity/Trendability/Prognosability)
-WS3 数据质量分级 消融实验
-WS4 多特征HI融合(单调性加权)"""
+"""Measurement extensions WS1-WS4 (based on the pre-extracted feature table; reads only the local
+parquet feature table, does not touch any raw-waveform store):
+WS1 trend-test method comparison (Spearman / Mann-Kendall+Sen / Pearson)
+WS2 health-indicator quality quantification (Monotonicity / Trendability / Prognosability)
+WS3 data-quality grading ablation experiment
+WS4 multi-feature HI fusion (monotonicity-weighted)"""
 import os, re
 import numpy as np
 import pandas as pd
@@ -50,10 +51,10 @@ def load():
 def main():
     df = load()
     u = df[df['usable']].copy()
-    named = u[u.point_name.str.contains('门|导轨|丝杠|换向|水电|升降', na=False)]
+    named = u[u.point_name.str.contains('reversing|commutator|ball|screw|guide|rail|seat|conn|lift', case=False, na=False)]
     pts = [p for p, c in named.point_name.value_counts().items() if c >= 8]
 
-    # ---- WS1 方法对比 (on td_rms) ----
+    # ---- WS1 method comparison (on td_rms) ----
     rows = []
     for p in pts:
         s = named[named.point_name == p].dropna(subset=['td_rms']).sort_values('t')
@@ -67,7 +68,7 @@ def main():
                                       'Sen_slope', 'Pearson_r', 'Pearson_p']).sort_values('Spearman_rho', ascending=False)
     ws1.to_csv(os.path.join(OUT, 'WS1_trend_method_comparison.csv'), index=False, encoding='utf-8-sig')
 
-    # ---- WS2 HI 质量量化 (跨测点, 逐特征) ----
+    # ---- WS2 HI quality quantification (across measurement points, per feature) ----
     feats = ['td_rms', 'td_std', 'td_peak', 'td_kurtosis', 'td_crest_factor',
              'td_impulse_factor', 'env_band_power', 'fd_total_power']
     feats = [f for f in feats if f in u.columns]
@@ -86,35 +87,36 @@ def main():
             ranges.append(np.ptp(y) if np.ptp(y) > 0 else 1.0)
         M = np.mean(mons)
         T = np.min(trends)                                   # Trendability = min |corr| over units
-        P = float(np.exp(-np.std(finals)/np.mean(ranges))) if ranges else 0  # Prognosability(近似)
+        P = float(np.exp(-np.std(finals)/np.mean(ranges))) if ranges else 0  # Prognosability (approximation)
         hi.append([f, round(M, 3), round(T, 3), round(P, 3), round(M+T+P, 3)])
     ws2 = pd.DataFrame(hi, columns=['feature', 'Monotonicity', 'Trendability', 'Prognosability', 'Score']).sort_values('Score', ascending=False)
     ws2.to_csv(os.path.join(OUT, 'WS2_HI_quality_metrics.csv'), index=False, encoding='utf-8-sig')
 
-    # ---- WS3 消融: 数据质量分级的价值 ----
-    # (a) 峭度型"冲击故障"排名: 不筛 vs 筛
-    allc = df[(df.sample_rate == 8000) & (~df.is_empty)]            # 不剔尖峰
-    clean = df[df['usable']]                                        # 剔尖峰
+    # ---- WS3 ablation: the value of data-quality grading ----
+    # (a) kurtosis-type "impulsive fault" ranking: no screening vs screening
+    allc = df[(df.sample_rate == 8000) & (~df.is_empty)]            # spikes NOT removed
+    clean = df[df['usable']]                                        # spikes removed
     top_all = allc.nlargest(20, 'td_kurtosis')
     n_spike_in_top = int(top_all['hard_spike'].sum())
-    ws3a = (f'峭度Top20(8kHz非空)中, 电气尖峰伪迹占 {n_spike_in_top}/20 '
-            f'({100*n_spike_in_top/20:.0f}%); 不做质量分级则故障排名被伪迹主导。\n'
-            f'尖峰通道中位峭度={allc[allc.hard_spike].td_kurtosis.median():.0f} vs '
-            f'可信通道中位峭度={clean.td_kurtosis.median():.2f}。')
-    # (b) 趋势筛查: 含/不含 传感器松动通道 对结论的影响
-    loose = {'CH 1-右门外导轨右-z轴', 'CH 10-右门-丝杠中'}
+    ws3a = (f'In the kurtosis Top20 (8kHz non-empty), electrical-spike artefacts account for {n_spike_in_top}/20 '
+            f'({100*n_spike_in_top/20:.0f}%); without quality grading the fault ranking is dominated by artefacts.\n'
+            f'Spike-channel median kurtosis={allc[allc.hard_spike].td_kurtosis.median():.0f} vs '
+            f'trustworthy-channel median kurtosis={clean.td_kurtosis.median():.2f}.')
+    # (b) trend screening: effect of including/excluding sensor-loosening channels on the conclusion
+    loose = {'CH1 guide rail R-z', 'CH10 screw R-mid'}
     n_sig_clean = (ws1['Spearman_p'].astype(float) < 0.05).sum()
     with open(os.path.join(OUT, 'WS3_ablation.txt'), 'w', encoding='utf-8') as fo:
-        fo.write('WS3 数据质量分级消融实验\n' + '='*40 + '\n')
-        fo.write('(a) 峭度型冲击故障排名 受伪迹污染程度:\n' + ws3a + '\n\n')
-        fo.write(f'(b) 传感器松动通道(CH1/CH10)若不剔除: 二者呈强负趋势(ρ≈-0.5/-0.76), '
-                 f'会被误读为"振动下降/部件改善", 实为传感器脱耦; 剔除后退化筛查仅保留物理可信测点。\n')
-        fo.write(f'\n结论: 数据质量分级是退化筛查可信度的前置必要步骤, 量化见上。\n')
+        fo.write('WS3 data-quality grading ablation experiment\n' + '='*40 + '\n')
+        fo.write('(a) Degree of artefact contamination of the kurtosis-type impulsive-fault ranking:\n' + ws3a + '\n\n')
+        fo.write(f'(b) Sensor-loosening channels (CH1/CH10) if not removed: both show a strong negative trend (rho approx. -0.5/-0.76), '
+                 f'which would be misread as "vibration decreasing / component improving" but is actually sensor decoupling; '
+                 f'after removal the degradation screening retains only physically trustworthy measurement points.\n')
+        fo.write(f'\nConclusion: data-quality grading is a necessary preliminary step for the trustworthiness of degradation screening; quantification above.\n')
 
-    # ---- WS4 多特征HI融合 (CH6/CH19, 单调性加权) ----
+    # ---- WS4 multi-feature HI fusion (CH6/CH19, monotonicity-weighted) ----
     w = ws2.set_index('feature')['Monotonicity']
     fz = []
-    for p in ['CH 6-下门-换向器-y轴', 'CH19-下门-右丝杠下']:
+    for p in ['CH6 reversing/commutator unit', 'CH19 ball screw R-low']:
         s = named[named.point_name == p].dropna(subset=feats).sort_values('t')
         if len(s) < 5:
             continue
@@ -127,11 +129,11 @@ def main():
     ws4 = pd.DataFrame(fz, columns=['point', 'Mono_RMS', 'Mono_fusedHI', 'rho_fusedHI'])
     ws4.to_csv(os.path.join(OUT, 'WS4_fused_HI.csv'), index=False, encoding='utf-8-sig')
 
-    print('=== WS1 趋势检验方法对比 ==='); print(ws1.to_string(index=False))
-    print('\n=== WS2 健康指标质量量化(逐特征, 跨测点) ==='); print(ws2.to_string(index=False))
-    print('\n=== WS3 消融 ==='); print(ws3a)
-    print('\n=== WS4 融合HI vs RMS 单调性 ==='); print(ws4.to_string(index=False))
-    print('\n输出 ->', OUT)
+    print('=== WS1 trend-test method comparison ==='); print(ws1.to_string(index=False))
+    print('\n=== WS2 health-indicator quality quantification (per feature, across measurement points) ==='); print(ws2.to_string(index=False))
+    print('\n=== WS3 ablation ==='); print(ws3a)
+    print('\n=== WS4 fused HI vs RMS monotonicity ==='); print(ws4.to_string(index=False))
+    print('\nOutput ->', OUT)
 
 
 if __name__ == '__main__':

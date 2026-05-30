@@ -1,31 +1,31 @@
 # -*- coding: utf-8 -*-
 """
 Vibration acceleration data — core decoding and feature library
-数据格式: little-endian int32, 无表头, 样本数 = 文件大小/4
-标定(经确认: 不除增益): g = raw * (Voltage_to / Range_to) / Sensitivity
-设计要点:
-  - 时域统计用分块累加矩(内存恒定, 应对超长记录)
-  - 频谱/包络用限长分析窗(中段, 默认20s)
+Data format: little-endian int32, no header, n_samples = file_size / 4
+Calibration (confirmed: gain is NOT divided out): g = raw * (Voltage_to / Range_to) / Sensitivity
+Design notes:
+  - Time-domain statistics use chunked moment accumulation (constant memory, handles very long records)
+  - Spectrum/envelope use a bounded analysis window (centre segment, default 20s)
 """
 import os, re, glob
 import numpy as np
 from scipy import signal, stats
 
 SR_DEFAULT = 8000
-ANALYSIS_SECONDS = 30.0          # 频谱/包络分析窗长度
-CHUNK_SAMPLES = 4_000_000        # 时域分块大小(int32, 约16MB/块)
+ANALYSIS_SECONDS = 30.0          # spectrum/envelope analysis window length
+CHUNK_SAMPLES = 4_000_000        # time-domain chunk size (int32, about 16MB/chunk)
 
 
 def _nperseg(fs, n):
-    """自适应谱段长: 目标约1Hz分辨率, 介于2048~32768, 不超过数据长度。"""
+    """Adaptive segment length: target about 1Hz resolution, between 2048 and 32768, not exceeding data length."""
     target = int(fs)
     target = max(2048, min(target, 32768))
     return min(target, n)
 
 
-# ---------------- .par 参数解析 ----------------
+# ---------------- .par parameter parsing ----------------
 def parse_par(par_path):
-    """解析 .par(INI风格), 容错中文(GBK)。返回 dict。"""
+    """Parse .par (INI style), tolerant of non-ASCII (GBK) text. Returns a dict."""
     d = {}
     with open(par_path, 'rb') as f:
         raw = f.read()
@@ -38,7 +38,7 @@ def parse_par(par_path):
 
 
 def get_scale(par):
-    """物理量换算系数: g = raw_int * scale。不除增益。"""
+    """Physical-unit conversion factor: g = raw_int * scale. Gain is NOT divided out."""
     try:
         v_to = float(par.get('Voltage to', 10000.0))      # mV
         r_to = float(par.get('Range to', 8388607.0))      # ADC counts
@@ -52,10 +52,10 @@ def get_scale(par):
 
 
 def channel_meta(sts_path):
-    """从 .sts 路径推导通道元信息(读取同名 .par)。"""
-    base = sts_path[:-4]  # 去掉 .sts
+    """Derive channel metadata from the feature-file path (reads the matching .par)."""
+    base = sts_path[:-4]  # strip the extension
     par_path = base + '.par'
-    fname = os.path.basename(base)              # 例: 'CH 1-右门外导轨右-z轴]'
+    fname = os.path.basename(base)              # e.g. 'CH1 guide rail R-z]'
     meas = os.path.basename(os.path.dirname(sts_path))
     par = parse_par(par_path) if os.path.exists(par_path) else {}
     fsize = os.path.getsize(sts_path)
@@ -84,9 +84,9 @@ def channel_meta(sts_path):
     }
 
 
-# ---------------- 数据读取 ----------------
+# ---------------- data reading ----------------
 def read_window(sts_path, scale, fs, seconds=ANALYSIS_SECONDS):
-    """读取中段分析窗, 返回物理量(g, float64)。"""
+    """Read the centre analysis window, return physical units (g, float64)."""
     nsamp = os.path.getsize(sts_path) // 4
     win = min(int(seconds * fs), nsamp)
     start = max(0, (nsamp - win) // 2)
@@ -94,9 +94,9 @@ def read_window(sts_path, scale, fs, seconds=ANALYSIS_SECONDS):
     return x.astype(np.float64) * scale
 
 
-# ---------------- 时域特征(分块累加, 内存恒定) ----------------
+# ---------------- time-domain features (chunked accumulation, constant memory) ----------------
 def time_domain_features(sts_path, scale):
-    """流式读取全量数据, 累加矩, 计算时域特征(物理量 g)。"""
+    """Stream the full record, accumulate moments, compute time-domain features (physical units, g)."""
     n = 0
     s1 = s2 = s3 = s4 = 0.0
     s_abs = 0.0
@@ -122,16 +122,16 @@ def time_domain_features(sts_path, scale):
     if n == 0:
         return {}
     mean = s1 / n
-    m2 = s2 / n - mean ** 2            # 方差
+    m2 = s2 / n - mean ** 2            # variance
     rms = np.sqrt(s2 / n)
     std = np.sqrt(max(m2, 0.0))
     abs_mean = s_abs / n
     sqrt_abs_mean = s_sqrt_abs / n
-    # 中心矩 -> 偏度/峭度
+    # central moments -> skewness / kurtosis
     m3 = s3 / n - 3 * mean * (s2 / n) + 2 * mean ** 3
     m4 = s4 / n - 4 * mean * (s3 / n) + 6 * mean ** 2 * (s2 / n) - 3 * mean ** 4
     skew = m3 / std ** 3 if std > 0 else 0.0
-    kurt = m4 / std ** 4 if std > 0 else 0.0          # 标准峭度(高斯≈3)
+    kurt = m4 / std ** 4 if std > 0 else 0.0          # standard kurtosis (Gaussian approx. 3)
     peak = max(abs(vmax), abs(vmin))
     p2p = vmax - vmin
     return {
@@ -154,7 +154,7 @@ def time_domain_features(sts_path, scale):
     }
 
 
-# ---------------- 频域特征(Welch PSD) ----------------
+# ---------------- frequency-domain features (Welch PSD) ----------------
 def frequency_features(x, fs, n_bands=8):
     nper = _nperseg(fs, len(x))
     if nper < 256:
@@ -162,7 +162,7 @@ def frequency_features(x, fs, n_bands=8):
     f, Pxx = signal.welch(x, fs=fs, nperseg=nper, noverlap=nper // 2)
     df = f[1] - f[0]
     P = Pxx.copy()
-    P[0] = 0.0                       # 去直流
+    P[0] = 0.0                       # remove DC
     total = P.sum()
     if total <= 0:
         return {'fd_total_power': 0.0}
@@ -178,7 +178,7 @@ def frequency_features(x, fs, n_bands=8):
         'fd_rms_freq': rms_freq,
         'fd_freq_std': freq_std,
     }
-    # 频带能量占比(等分到 Nyquist)
+    # band energy fractions (equal split up to Nyquist)
     edges = np.linspace(0, fs / 2, n_bands + 1)
     for b in range(n_bands):
         m = (f >= edges[b]) & (f < edges[b + 1])
@@ -186,10 +186,11 @@ def frequency_features(x, fs, n_bands=8):
     return feats
 
 
-# ---------------- 包络谱特征(Hilbert, 故障诊断) ----------------
+# ---------------- envelope-spectrum features (Hilbert, fault diagnosis) ----------------
 def envelope_features(x, fs, band=None, top_k=5, mod_fmax=None):
-    """带通(高频共振解调)->Hilbert包络->包络谱; 提取调制/故障频段主峰。
-    band 缺省按 fs 自适应取上半频段(0.3~0.95*Nyquist); mod_fmax 缺省 0.05*fs。"""
+    """Band-pass (high-frequency resonance demodulation) -> Hilbert envelope -> envelope spectrum;
+    extract dominant peaks in the modulation/fault band.
+    band defaults to the adaptive upper half-band (0.3~0.95*Nyquist); mod_fmax defaults to 0.05*fs."""
     nyq = fs / 2.0
     if band is None:
         band = (0.30 * nyq, 0.95 * nyq)
@@ -228,7 +229,7 @@ def envelope_features(x, fs, band=None, top_k=5, mod_fmax=None):
     return feats
 
 
-# ---------------- 单通道完整处理 ----------------
+# ---------------- full single-channel processing ----------------
 def process_channel(sts_path):
     meta = channel_meta(sts_path)
     scale = meta['scale_g_per_count']

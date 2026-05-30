@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""R 类分析(需重读 220GB 原始波形, 外置盘连接后跑)。
-R1 已实现: 关键通道全程滑窗 RMS/峭度轨迹(记录内时变, 最大增量来源)。
-R2/R3/R4 为桩(spec 见 docstring), 待补完。
-依赖 vibe_core(同目录)。解释器: python -X utf8
-用法:
-  python ws_raw_trajectory.py --check         # 仅校验外置盘可读 + 枚举 .sts
-  python ws_raw_trajectory.py --r1            # 跑 R1 滑窗轨迹
+"""R-class analysis (re-reads the raw waveforms, run after the external drive is connected).
+R1 implemented: full-record sliding-window RMS/kurtosis trajectories for key channels
+(within-record time variation, source of the largest increments).
+R2/R3/R4 are stubs (spec in each docstring), to be completed.
+Depends on vibe_core (same directory). Interpreter: python -X utf8
+Usage:
+  python ws_raw_trajectory.py --check         # only verify the raw store is readable + enumerate waveform files
+  python ws_raw_trajectory.py --r1            # run R1 sliding-window trajectories
 """
 import sys, io, os, re, argparse
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -14,14 +15,14 @@ import pandas as pd
 
 import vibe_core as V
 
-# ---- 配置: 外置盘根目录(盘符可能变, 连盘后核对) ----
+# ---- Config: raw store root directory (verify the path after connecting the drive) ----
 RAW_ROOT = r'./data/raw'
 OUT = r'./results'
 
-# R1 关键通道(按 point_name 子串匹配, 复用会议版结论通道)
-TARGET_SUBSTR = ['换向器', '右丝杠下', '升降右丝杠', '丝杠中']  # CH6/CH19/CH16/CH10
-WIN_S = 1.0      # 滑窗长度(秒)
-HOP_S = 1.0      # 步长(秒); 等于 WIN_S 即不重叠
+# R1 key channels (matched by point_name substring; reuses the channels from the conference version)
+TARGET_SUBSTR = ['reversing', 'commutator', 'ball', 'screw']  # CH6/CH19/CH16/CH10
+WIN_S = 1.0      # sliding-window length (seconds)
+HOP_S = 1.0      # hop (seconds); equal to WIN_S means no overlap
 
 
 def ts(m):
@@ -32,17 +33,18 @@ def ts(m):
 
 def check_drive():
     if not os.path.isdir(RAW_ROOT):
-        print(f'[FAIL] 外置盘根目录不存在: {RAW_ROOT}\n  -> 改本文件顶部 RAW_ROOT 为正确盘符/路径')
+        print(f'[FAIL] raw store root directory not found: {RAW_ROOT}\n  -> edit RAW_ROOT at the top of this file to the correct path')
         return []
     stss = V.find_all_sts(RAW_ROOT)
-    print(f'[OK] 枚举到 {len(stss)} 个 .sts')
+    print(f'[OK] enumerated {len(stss)} raw waveform files')
     for p in stss[:3]:
         print('   ', p)
     return stss
 
 
 def sliding_trajectory(sts_path, scale, fs, win_s=WIN_S, hop_s=HOP_S, max_windows=None):
-    """对单条记录做全程滑窗 RMS/峭度轨迹。顺序读取, 内存恒定。"""
+    """Compute full-record sliding-window RMS/kurtosis trajectory for a single record.
+    Sequential read, constant memory."""
     total = os.path.getsize(sts_path) // 4
     win = int(win_s * fs)
     hop = int(hop_s * fs)
@@ -60,7 +62,7 @@ def sliding_trajectory(sts_path, scale, fs, win_s=WIN_S, hop_s=HOP_S, max_window
         off += hop
         if max_windows and len(rows) >= max_windows:
             break
-    return np.array(rows)  # 列: [t_sec, rms, kurtosis]
+    return np.array(rows)  # columns: [t_sec, rms, kurtosis]
 
 
 def run_r1():
@@ -68,7 +70,7 @@ def run_r1():
     stss = check_drive()
     if not stss:
         return
-    # 建索引: 每个 .sts 的 meta(用 8kHz, 跳过空/尖峰由后续可选过滤)
+    # Build index: meta for each record (use 8 kHz, optional empty/spike filtering applied later)
     recs = []
     for p in stss:
         meta = V.channel_meta(p)
@@ -77,7 +79,7 @@ def run_r1():
         if not any(sub in meta['point_name'] for sub in TARGET_SUBSTR):
             continue
         recs.append(meta)
-    print(f'匹配关键通道记录: {len(recs)}')
+    print(f'records matching key channels: {len(recs)}')
     summary = []
     for meta in recs:
         traj = sliding_trajectory(meta['sts_path'], meta['scale_g_per_count'], meta['sample_rate'])
@@ -85,11 +87,12 @@ def run_r1():
             continue
         sess = meta['measurement']
         pt = meta['point_name']
-        # 存逐窗轨迹
+        # Store per-window trajectory
         fn = f"{sess}__{pt}".replace(' ', '_').replace('/', '_').replace('\\', '_')[:120]
         np.savetxt(os.path.join(OUT, f'R1_traj__{fn}.csv'), traj,
                    delimiter=',', header='t_sec,rms,kurtosis', comments='', fmt='%.6f')
-        # 场次级汇总: 窗级分布而非单点(论文卖点: 揭示记录内非平稳)
+        # Session-level summary: window-level distribution rather than a single point
+        # (paper point: reveals within-record non-stationarity)
         rms_w, kurt_w = traj[:, 1], traj[:, 2]
         summary.append({
             'measurement': sess, 'point_name': pt, 't': ts(sess),
@@ -102,34 +105,40 @@ def run_r1():
         })
     df = pd.DataFrame(summary).sort_values(['point_name', 't'])
     df.to_csv(os.path.join(OUT, 'R1_window_level_summary.csv'), index=False, encoding='utf-8-sig')
-    print(f'[done] R1 轨迹与窗级汇总 -> {OUT}')
+    print(f'[done] R1 trajectories and window-level summary -> {OUT}')
     print(df.to_string(index=False))
 
 
-# ---- R2/R3/R4 桩(spec, 待补完) ----
+# ---- R2/R3/R4 stubs (spec, to be completed) ----
 def run_r2():
-    """R2 跨传感器空间一致性(替代验证):
-    取同一部件相邻测点(如换向器多测点/同侧丝杠上中下), 计算其跨场次 RMS 趋势的
-    两两相关; 真实退化应多测点同向(高相关), 单通道伪迹则孤立。
-    输入: 可直接用本地 features_all.parquet 的 td_rms(不必重读原始!), 因此 R2 其实
-    也能在本地先做 -- 见 ws1_4_methods 的 load()。产出: 测点×测点相关热图 + 同步性指标。"""
-    raise NotImplementedError('R2 待补; 提示: 可用本地 parquet 先做, 见 docstring')
+    """R2 cross-sensor spatial consistency (alternative validation):
+    take neighboring measurement points on the same component (e.g. multiple points on the
+    reversing/commutator unit / same-side ball-screw upper-mid-lower), compute the pairwise
+    correlation of their cross-session RMS trends; genuine degradation should be co-directional
+    across multiple points (high correlation), whereas a single-channel artifact is isolated.
+    Input: can directly use the local features_all.parquet td_rms (no need to re-read the raw!),
+    so R2 can in fact be done locally first -- see load() in ws1_4_methods. Output:
+    point-by-point correlation heatmap + synchronization metric."""
+    raise NotImplementedError('R2 to be done; hint: can use the local parquet first, see docstring')
 
 
 def run_r3():
-    """R3 退化轨迹建模 + 变点检测:
-    对 CH6/CH19 的跨场次 RMS 序列(序数轴)拟合 线性/指数, 给 Bootstrap CI;
-    用 ruptures/PELT 或简单 CUSUM 检测退化拐点。强调序数轴非标定时间。
-    可用本地 parquet, 不必重读原始。"""
-    raise NotImplementedError('R3 待补')
+    """R3 degradation trajectory modeling + change-point detection:
+    fit linear/exponential to the cross-session RMS series (ordinal axis) for CH6/CH19,
+    give bootstrap CI; detect degradation knees with ruptures/PELT or a simple CUSUM.
+    Emphasize ordinal axis, not calibrated time.
+    Can use the local parquet, no need to re-read the raw."""
+    raise NotImplementedError('R3 to be done')
 
 
 def run_r4():
-    """R4 轴/丝杠阶次分析(需原始波形):
-    对关键通道关键场次重算细分辨率 Welch + 包络谱, 比对 50Hz(电机)、1.83/4.58Hz(丝杠转频)
-    及其谐波/边带; 能匹配的标注为轴序来源, 轴承 BPFO 因缺几何明确留为局限。
-    用 vibe_core.read_window + frequency_features/envelope_features(可调 band)。"""
-    raise NotImplementedError('R4 待补')
+    """R4 shaft/screw order analysis (needs the raw waveforms):
+    recompute fine-resolution Welch + envelope spectrum for key channels at key sessions,
+    compare against 50 Hz (motor), 1.83/4.58 Hz (screw rotation) and their harmonics/sidebands;
+    matches are labeled as shaft-order sources, bearing BPFO is left as a limitation due to
+    missing explicit geometry.
+    Use vibe_core.read_window + frequency_features/envelope_features (tunable band)."""
+    raise NotImplementedError('R4 to be done')
 
 
 if __name__ == '__main__':

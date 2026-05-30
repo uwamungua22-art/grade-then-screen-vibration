@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""F6 Fig4: R1 记录内窗级 RMS 分布随场次（英文、期刊风格）。
-读 R1_window_level_summary.csv，画 CH6/CH19 每场次的窗级 RMS 中位+（p05,p95）带，
-揭示退化伴随记录内非平稳性增长。解释器 python -X utf8"""
+"""F6 Fig4: R1 in-record window-level RMS distribution across sessions (English, journal style).
+Reads R1_window_level_summary.csv and plots, for CH6/CH19, the per-session window-level RMS
+median plus (p05, p95) band, revealing that degradation is accompanied by growing in-record
+non-stationarity. Interpreter: python -X utf8"""
 import os, io, sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import numpy as np, pandas as pd
@@ -20,8 +21,8 @@ CM = 1 / 2.54
 df = pd.read_csv(os.path.join(OUT, 'R1_window_level_summary.csv'))
 df['t'] = pd.to_datetime(df['t'])
 
-panels = [('CH 6-下门-换向器-y轴', 'CH6 reversing/commutator', CB['green'], 7),
-          ('CH19-下门-右丝杠下', 'CH19 right ball-screw', CB['blue'], 9)]
+panels = [('CH6 reversing/commutator unit', 'CH6 reversing/commutator', CB['green'], 7),
+          ('CH19 ball screw R-low', 'CH19 right ball-screw', CB['blue'], 9)]
 fig, axs = plt.subplots(1, 2, figsize=(17.6 * CM, 6.6 * CM))
 for ax, (pt, title, c, cp) in zip(axs, panels):
     s = df[df.point_name == pt].sort_values('t').reset_index(drop=True)
