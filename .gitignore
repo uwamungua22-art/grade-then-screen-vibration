@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data & outputs (not distributed)
+data/
+results/
+*.parquet
+*.csv
+*.sts
+*.par
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
